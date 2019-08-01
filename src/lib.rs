@@ -114,8 +114,6 @@ fn compile_build_crate(build_dir: &BuildDir, cargo: &str, temp: &str, path: &str
         .output()
         .expect("failed to compile build-script crate");
 
-    println!("{:#?}", res);
-
     assert!(
         res.status.success(),
         "Failed to run compile build crate at {} with {:#?}",
