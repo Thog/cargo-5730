@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::time::SystemTime;
 use std::{env, fs, path, process};
 
 /// A scoped wrapper for the directory where we'll compile and run the build script.
@@ -8,18 +8,10 @@ struct BuildDir {
 
 impl BuildDir {
     fn new() -> Self {
-        let mut random_data = [0u8; 16];
-        let mut file = fs::File::open("/dev/urandom").expect("failed to open /dev/urandom");
-        file.read_exact(&mut random_data)
-            .expect("failed to read /dev/urandom");
-
-        let mut hex_str = String::new();
-        for digit in random_data.iter() {
-            hex_str = hex_str + &format!("{:x}", digit)
-        }
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).expect("Cannot compute duration since UNIX epoch");
 
         let mut dir = env::temp_dir();
-        dir.push(format!("build-script-{}", hex_str));
+        dir.push(format!("build-script-{}", now.as_secs()));
 
         BuildDir {
             path: dir,
@@ -41,26 +33,35 @@ impl Drop for BuildDir {
 }
 
 fn cp_r(in_dir: &path::Path, out_dir: &path::Path) {
-    let res = process::Command::new("cp")
-        .arg("-r")
-        .arg(in_dir)
-        .arg(out_dir)
-        .stdout(process::Stdio::inherit())
-        .stderr(process::Stdio::inherit())
-        .output()
-        .expect(&format!(
-            "Failed to cp -r {} {}",
-            in_dir.display(),
-            out_dir.display()
-        ));
+    for entry in in_dir.read_dir().expect("read_dir call failed") {
+        let entry = entry.expect("Cannot access directory entry");
+        let entry_type = entry.file_type().expect("Cannot get directory entry file type");
+        let entry_path = entry.path();
 
-    assert!(
-        res.status.success(),
-        "Failed to cp -r {} {} with {:?}",
-        in_dir.display(),
-        out_dir.display(),
-        res
-    );
+        let mut out_entry_path = out_dir.to_path_buf();
+        out_entry_path.push(entry.file_name());
+
+        if entry_type.is_dir() {
+            fs::create_dir_all(out_entry_path.clone()).expect("Cannot create directory");
+            cp_r(&entry_path, &out_entry_path);
+        } else {
+            // Check for potential conflict
+            if out_entry_path.exists() {
+                if out_entry_path.is_dir() {
+                    fs::remove_dir_all(out_entry_path.clone()).expect("Cannot clear conflicting directory");
+                } else {
+                    fs::remove_file(out_entry_path.clone()).expect("Cannot remove conflicting file");
+                }
+            }
+
+            let mut out_file = fs::File::create(out_entry_path.clone()).expect(&format!(
+                "Couldn't create output file: {}",
+                out_entry_path.display()
+            ));
+            let mut in_file = fs::File::open(entry_path).expect("Cannot open input file");
+            std::io::copy(&mut in_file, &mut out_file).expect("Cannot copy file content");
+        }
+    }
 }
 
 
@@ -71,10 +72,13 @@ fn qualify_cargo_toml_paths_in_text(cargo_toml_content: &str, base_dir: &path::P
     // Lacking a real parser due to constraints, look for a couple of common
     // patterns. TODO: Roll a little parser for this.
     let mut cargo_toml = cargo_toml_content.to_owned();
-    cargo_toml = cargo_toml.replace("path = \"", &format!("path = \"{}/", base_dir.display()));
-    cargo_toml = cargo_toml.replace("path=\"", &format!("path=\"{}/", base_dir.display()));
-    cargo_toml = cargo_toml.replace("path = '", &format!("path = '{}/", base_dir.display()));
-    cargo_toml = cargo_toml.replace("path='", &format!("path='{}/", base_dir.display()));
+
+    let base_dir = base_dir.to_str().expect("Cannot convert base_path to str").to_string().escape_default().to_string();
+
+    cargo_toml = cargo_toml.replace("path = \"", &format!("path = \"{}/", base_dir));
+    cargo_toml = cargo_toml.replace("path=\"", &format!("path=\"{}/", base_dir));
+    cargo_toml = cargo_toml.replace("path = '", &format!("path = '{}/", base_dir));
+    cargo_toml = cargo_toml.replace("path='", &format!("path='{}/", base_dir));
     cargo_toml
 }
 
@@ -91,10 +95,15 @@ fn qualify_cargo_toml_paths(cargo_toml_path: &path::Path, base_dir: &path::Path)
     ));
 }
 
-fn compile_build_crate(build_dir: &BuildDir, cargo: &str, path: &str, ssh_auth_sock: &str, rustup_home: &str, rustup_toolchain: &str) {
+fn compile_build_crate(build_dir: &BuildDir, cargo: &str, temp: &str, path: &str, ssh_auth_sock: &str, rustup_home: &str, rustup_toolchain: &str) {
+    // For LLVM dll initialization on Windows.
+    let systemroot = env::var("SYSTEMROOT").unwrap_or_default();
+
     let res = process::Command::new(cargo)
         .args(&["build", "-vv"])
         .env_clear()
+        .env("TEMP", temp)
+        .env("SYSTEMROOT", systemroot)
         .env("PATH", path)
         .env("SSH_AUTH_SOCK", ssh_auth_sock)
         .env("RUSTUP_HOME", rustup_home)
@@ -104,6 +113,8 @@ fn compile_build_crate(build_dir: &BuildDir, cargo: &str, path: &str, ssh_auth_s
         .stderr(process::Stdio::inherit())
         .output()
         .expect("failed to compile build-script crate");
+
+    println!("{:#?}", res);
 
     assert!(
         res.status.success(),
@@ -154,6 +165,7 @@ pub fn run_build_crate<P: AsRef<path::Path>>(build_crate_src: P) {
         ));
 
     let cargo = env::var("CARGO").expect("Can't get CARGO from env");
+    let temp = env::var("TEMP").unwrap_or_default();
     let path = env::var("PATH").expect("Can't get PATH from env");
     let ssh_auth_sock = env::var("SSH_AUTH_SOCK").unwrap_or_default();
     let base_dir = env::var("CARGO_MANIFEST_DIR").expect("Can't get CARGO_MANIFEST_DIR from env");
@@ -170,13 +182,14 @@ pub fn run_build_crate<P: AsRef<path::Path>>(build_crate_src: P) {
         &build_crate_src.display(),
         build_dir.path.display()
     );
+    fs::create_dir_all(build_dir.path.clone()).expect("Cannot create build directory");
     cp_r(build_crate_src, &build_dir.path);
 
     // Having copied the crate, we need to fix any relative paths that were in
     // the Cargo.toml
     qualify_cargo_toml_paths(&build_dir.path.join("Cargo.toml"), &base_dir);
 
-    compile_build_crate(&build_dir, &cargo, &path, &ssh_auth_sock, &rustup_home, &rustup_toolchain);
+    compile_build_crate(&build_dir, &cargo, &temp, &path, &ssh_auth_sock, &rustup_home, &rustup_toolchain);
 
     // Run the build script with its original source directory as the working
     // dir.
